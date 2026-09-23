@@ -278,13 +278,15 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertLess(len(tool["description"]), 130)
         self.assertLess(len(json.dumps(tool["parameters"])),
                         len(json.dumps(payload["tools"][0]["parameters"])))
-        # big function_call_output goes up intact: no middle truncation, no marker
+        # big function_call_output: structurally compressed, still valid JSON
         outs = [i for i in sent["input"] if i.get("type") == "function_call_output"]
         self.assertEqual(len(outs), 1)
-        self.assertEqual(json.loads(outs[0]["output"]), json.loads(big_json))  # every row intact
-        self.assertIn("q" * 1000, outs[0]["output"])                           # long values not cut
-        for marker in ("[...truncated...]", "[...compressed"):
-            self.assertNotIn(marker, outs[0]["output"])
+        self.assertLess(len(outs[0]["output"]), len(big_json))
+        parsed = json.loads(outs[0]["output"])           # stays parseable
+        self.assertEqual(len(parsed["rows"]), 8)         # every row present
+        self.assertEqual(set(parsed.keys()), {"rows"})
+        self.assertIn("[...truncated: 4000 chars...]", parsed["rows"][0]["d"])  # value-level cut only
+        self.assertNotIn("[...truncated...]", outs[0]["output"])
         self.assertNotIn("[ccr:", outs[0]["output"])
         self.assertNotIn("[ccr:", json.dumps(sent["input"]))
         # function_call + small messages untouched

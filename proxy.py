@@ -1010,8 +1010,10 @@ def _compress_for_role(text: str, role: str, query: str | None = None, msg_age: 
     msg_age = turns from end of conversation (0 = latest); deep-history tool
     results get the aggressive 0.15 ratio."""
     ratio = 0.15 if (AGE_SPLIT_TURNS and role == "tool" and msg_age >= AGE_SPLIT_TURNS) else 0.50
-    # If query provided and text is large, use query-aware compression first
-    if query and role == "tool" and len(text) > 500:
+    # If query provided and text is large, use query-aware compression first.
+    # JSON is excluded: the line scorer never matches inside a JSON blob, so it
+    # returns it untouched and the structural compressor below never runs.
+    if query and role == "tool" and len(text) > 500 and _detect_content_type(text) != "json":
         text = _compress_aware(text, query)
         # After query-aware, might still be large — do a final pass
         if len(text) > 500:
