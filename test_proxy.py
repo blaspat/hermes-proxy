@@ -86,6 +86,26 @@ class CompressorTests(unittest.TestCase):
         self.assertLess(len(parsed["items"][0]["data"]), 1000)
         self.assertEqual(set(parsed.keys()), {"status", "items", "count"})
 
+    def test_no_truncation_anywhere(self):
+        lines = ["line %04d payload %s" % (i, "x" * 40) for i in range(40)]
+        lines[20] = "IMPORTANT-MIDDLE-PARAGRAPH must survive"
+        text = "\n".join(lines)
+        for fn in (proxy._compress_text, proxy._compress_log, proxy._compress_terminal):
+            out = fn(text)
+            self.assertIn("IMPORTANT-MIDDLE-PARAGRAPH", out, fn.__name__)
+            self.assertNotIn("[...truncated...]", out, fn.__name__)
+            self.assertNotIn("paragraphs reduced", out, fn.__name__)
+        self.assertFalse(hasattr(proxy, "_truncate_to_target"))
+
+    def test_tool_schema_stays_parseable(self):
+        big = {"name": "do_thing", "description": "d" * 300, "parameters": {
+            "type": "object", "required": ["p0"],
+            "properties": {("p%d" % i): {"type": "string", "description": "x" * 400} for i in range(40)}}}
+        text = json.dumps(big)
+        out = proxy._compress_tool_schema(text, 0.15)
+        self.assertLessEqual(len(out), len(text))
+        json.loads(out)  # must stay valid JSON, never a mid-string text cut
+
     def test_json_content_no_gain_returns_original(self):
         self.assertEqual(proxy._compress_json_content('{"a":1}'), '{"a":1}')
         not_json = "hello world " * 100
@@ -224,7 +244,7 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(upstream.last["content"], b"not json at all")
 
-    def test_responses_api_flat_tools_and_input_compressed(self):
+    def test_responses_api_flat_tools_compressed_input_intact(self):
         big_json = json.dumps({"rows": [{"d": "q" * 4000} for _ in range(8)]})
         payload = {
             "model": "test",
@@ -258,10 +278,13 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertLess(len(tool["description"]), 130)
         self.assertLess(len(json.dumps(tool["parameters"])),
                         len(json.dumps(payload["tools"][0]["parameters"])))
-        # big function_call_output compressed without a model-visible recovery marker
+        # big function_call_output goes up intact: no middle truncation, no marker
         outs = [i for i in sent["input"] if i.get("type") == "function_call_output"]
         self.assertEqual(len(outs), 1)
-        self.assertLess(len(outs[0]["output"]), len(big_json))
+        self.assertEqual(json.loads(outs[0]["output"]), json.loads(big_json))  # every row intact
+        self.assertIn("q" * 1000, outs[0]["output"])                           # long values not cut
+        for marker in ("[...truncated...]", "[...compressed"):
+            self.assertNotIn(marker, outs[0]["output"])
         self.assertNotIn("[ccr:", outs[0]["output"])
         self.assertNotIn("[ccr:", json.dumps(sent["input"]))
         # function_call + small messages untouched
@@ -286,7 +309,9 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(sent["input"][0], reasoning)
 
     def test_responses_api_string_input_compressed(self):
-        payload = {"model": "test", "input": "hello world " * 300}
+        # duplicated block → shrinks by line dedup, never by truncation
+        block = "\n".join(f"line {i}: hello world" for i in range(60))
+        payload = {"model": "test", "input": "\n\n".join([block, block])}
         upstream = _FakeUpstream(_resp(b'{"usage": {"input_tokens": 1}}'))
         with TestClient(proxy.app) as client:
             proxy._http = upstream
@@ -294,6 +319,7 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         sent = json.loads(upstream.last["content"])
         self.assertLess(len(sent["input"]), len(payload["input"]))
+        self.assertIn("line 59: hello world", sent["input"])
         self.assertNotIn("[ccr:", sent["input"])
         self.assertTrue(proxy.REQUEST_STATS[-1]["recovery_handles"])
 
@@ -392,7 +418,8 @@ class ProxyEndToEndTests(unittest.TestCase):
             proxy.UPSTREAM_KEY = old_key
 
     def test_responses_input_text_hides_recovery_marker(self):
-        original = "\n".join(f"line {i}: output" for i in range(100))
+        block = "\n".join(f"line {i}: output" for i in range(100))
+        original = "\n\n".join([block, block, block])  # dedup-compressible, no truncation
         payload = {"model": "test", "input": [{
             "type": "message", "role": "user",
             "content": [{"type": "input_text", "text": original},
@@ -410,7 +437,8 @@ class ProxyEndToEndTests(unittest.TestCase):
         self.assertEqual(proxy._recovery_get(handles[0]), original)
 
     def test_anthropic_tool_result_list_hides_recovery_marker(self):
-        original = "\n".join(f"line {i}: output" for i in range(100))
+        block = "\n".join(f"line {i}: output" for i in range(100))
+        original = "\n\n".join([block, block, block])  # dedup-compressible, no truncation
         payload = {"model": "test", "messages": [{
             "role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": [
