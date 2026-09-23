@@ -288,13 +288,14 @@ def _classify_message(content: str, role: str, has_tool_calls: bool = False) -> 
 # ─── Compressor (inlined from context-bridge/compressor.py) ────────────────────
 
 def _compress_text(text: str, ratio: float = 0.50) -> str:
-    """Compress text to approximately ratio of original size.
-    Deduplicates lines, collapses whitespace, truncates middle if needed."""
+    """Compress text by removing duplicate lines and collapsing whitespace.
+
+    Never truncates: no line or paragraph is dropped positionally, so an
+    important middle section survives. `ratio` is kept for call-site
+    compatibility and no longer caps the result.
+    """
     if not text or len(text) < 100:
         return text
-
-    original_len = len(text)
-    target_len = int(original_len * ratio)
 
     # Step 1: remove exact duplicate lines (preserving order)
     lines = text.split("\n")
@@ -313,37 +314,7 @@ def _compress_text(text: str, ratio: float = 0.50) -> str:
     # Step 2: collapse multiple blank lines
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # Step 3: if still over target, truncate by removing middle paragraphs
-    if len(text) > target_len:
-        text = _truncate_to_target(text, target_len)
-
     return text
-
-def _truncate_to_target(text: str, target_len: int) -> str:
-    """Truncate text to target length, keeping beginning and end."""
-    if len(text) <= target_len:
-        return text
-
-    paragraphs = re.split(r"\n\n+", text)
-
-    if len(paragraphs) <= 2:
-        return text[:target_len - 20] + "\n[...truncated...]"
-
-    n = len(paragraphs)
-    keep_head = max(1, n // 3)
-    keep_tail = max(1, n // 3)
-
-    head = paragraphs[:keep_head]
-    tail = paragraphs[-keep_tail:]
-
-    result = "\n\n".join(head) + "\n\n[...compressed: {} paragraphs reduced to {}...]\n\n".format(
-        n, keep_head + keep_tail
-    ) + "\n\n".join(tail)
-
-    if len(result) > target_len:
-        result = result[:target_len - 20] + "\n[...truncated...]"
-
-    return result
 
 def _compress_tool_result(text: str, ratio: float = 0.50) -> str:
     """Specialized compression for tool results."""
@@ -425,11 +396,10 @@ _DROP_LEVEL_RE = re.compile(r"\b(?:DEBUG|TRACE)\b", re.IGNORECASE)
 _PATH_LN_RE = re.compile(r"(/[^\s:]+):(\d+)")
 
 def _compress_log(text: str, ratio: float = 0.40) -> str:
-    """Compress log files: drop DEBUG, collapse repeats, keep errors, truncate."""
+    """Compress log files: drop DEBUG, collapse repeats, keep errors. Never truncates."""
     if not text or len(text) < 100:
         return text
 
-    original_len = len(text)
     lines = text.split('\n')
 
     # Step 1: Strip timestamps, drop DEBUG/TRACE lines
@@ -494,43 +464,8 @@ def _compress_log(text: str, ratio: float = 0.40) -> str:
 
     result = "\n".join(deduped).strip()
 
-    # Step 4: If still too large, keep first/last 20% BUT always keep ERROR/WARN/FATAL
-    target_len = int(original_len * ratio)
-    if len(result) > target_len:
-        result_lines = result.split('\n')
-        n = len(result_lines)
-        head_count = max(1, n // 5)
-        tail_count = max(1, n // 5)
-        
-        # Always collect important lines (ERROR/WARN/FATAL)
-        important_indices = set()
-        important_lines = []
-        for idx, line in enumerate(result_lines):
-            if _KEEP_LEVEL_RE.search(line):
-                important_indices.add(idx)
-                important_lines.append(line)
-        
-        # Build kept lines: head + important (not in head/tail) + tail
-        head = result_lines[:head_count]
-        tail = result_lines[-tail_count:]
-        tail_indices = set(range(n - tail_count, n))
-        
-        # Important lines that aren't in head or tail
-        mid_important = []
-        for idx, line in enumerate(result_lines):
-            if idx in important_indices and idx not in set(range(head_count)) and idx not in tail_indices:
-                mid_important.append(line)
-        
-        all_kept = head + mid_important + tail
-        # Deduplicate while preserving order
-        seen = set()
-        deduped = []
-        for line in all_kept:
-            if line not in seen:
-                seen.add(line)
-                deduped.append(line)
-        
-        result = "\n".join(deduped) + f"\n[...compressed: {n} lines → kept {len(deduped)} with {len(mid_important)} important lines...]"
+    # No truncation: the whole (deduplicated, noise-filtered) log is kept so
+    # nothing important is dropped positionally.
 
     return result
 
@@ -614,8 +549,6 @@ def _compress_terminal(text: str, ratio: float = 0.50) -> str:
     if not text or len(text) < 100:
         return text
 
-    original_len = len(text)
-
     # Step 1: Strip ANSI escape codes
     cleaned = _ANSI_RE.sub("", text)
 
@@ -688,10 +621,7 @@ def _compress_terminal(text: str, ratio: float = 0.50) -> str:
 
     result = "\n".join(result_lines).strip()
 
-    # Step 6: If still too large, truncate middle (like _compress_text)
-    target_len = int(original_len * ratio)
-    if len(result) > target_len:
-        result = _truncate_to_target(result, target_len)
+    # Step 6: no truncation — return everything that survived noise filtering
 
     return result
 
@@ -700,7 +630,6 @@ def _compress_system_prompt(text: str, ratio: float = 0.50) -> str:
     if not text or len(text) < 200:
         return text
 
-    target_len = int(len(text) * ratio)
     sections = re.split(r"(?m)^(#{1,3}\s+.+)$", text)
 
     if len(sections) <= 1:
@@ -857,7 +786,8 @@ def _compress_tool_schema(text: str, ratio: float = 0.50) -> str:
         return _compress_text(text, ratio)
 
     if len(result) > target_len:
-        result = _truncate_to_target(result, target_len)
+        # Truncating JSON as text produces unparseable output; no gain → keep original
+        return text
     return result
 
 # ─── Diff compressor ─────────────────────────────────────────────────────────
@@ -878,8 +808,6 @@ def _compress_diff(text: str, ratio: float = 0.50) -> str:
     if not text or len(text) < 100:
         return text
 
-    original_len = len(text)
-    target_len = int(original_len * ratio)
     lines = text.split("\n")
 
     output_files = []
@@ -943,8 +871,6 @@ def _compress_diff(text: str, ratio: float = 0.50) -> str:
 
     result = "\n".join(kept_lines).strip()
 
-    if len(result) > target_len:
-        result = _truncate_to_target(result, target_len)
     return result
 
 # ─── HTML compressor ─────────────────────────────────────────────────────────
@@ -1013,8 +939,6 @@ def _compress_html(text: str, ratio: float = 0.50) -> str:
     result = re.sub(r"\n{3,}", "\n\n", result)
     result = result.strip()
 
-    if len(result) > target_len:
-        result = _truncate_to_target(result, target_len)
     return result
 
 # ─── Query-aware compression ──────────────────────────────────────────────────
@@ -1086,8 +1010,10 @@ def _compress_for_role(text: str, role: str, query: str | None = None, msg_age: 
     msg_age = turns from end of conversation (0 = latest); deep-history tool
     results get the aggressive 0.15 ratio."""
     ratio = 0.15 if (AGE_SPLIT_TURNS and role == "tool" and msg_age >= AGE_SPLIT_TURNS) else 0.50
-    # If query provided and text is large, use query-aware compression first
-    if query and role == "tool" and len(text) > 500:
+    # If query provided and text is large, use query-aware compression first.
+    # JSON is excluded: the line scorer never matches inside a JSON blob, so it
+    # returns it untouched and the structural compressor below never runs.
+    if query and role == "tool" and len(text) > 500 and _detect_content_type(text) != "json":
         text = _compress_aware(text, query)
         # After query-aware, might still be large — do a final pass
         if len(text) > 500:
